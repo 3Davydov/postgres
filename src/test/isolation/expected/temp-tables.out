@@ -1,0 +1,92 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1_st1 s1_st2 s2_st1
+step s1_st1: CREATE TEMP TABLE test_tmp(id int);
+step s1_st2: INSERT INTO temp_schema_id SELECT pg_my_temp_schema();
+s2: NOTICE:  cannot access temporary tables of other sessions
+s2: NOTICE:  cannot access temporary tables of other sessions
+s2: NOTICE:  cannot access temporary tables of other sessions
+s2: NOTICE:  cannot access temporary tables of other sessions
+s2: NOTICE:  cannot access temporary tables of other sessions
+s2: NOTICE:  cannot access temporary tables of other sessions
+s2: NOTICE:  cannot access temporary tables of other sessions
+step s2_st1: 
+    DO $$
+        DECLARE
+            schema_name text;
+            result      RECORD;
+        BEGIN
+            -- Find out name of temporary schema of first session
+            SELECT nspname INTO schema_name
+              FROM pg_namespace
+             WHERE oid = (SELECT oid FROM temp_schema_id LIMIT 1);
+
+            -- Both INSERT operation must fail due to 'cannot access temporary
+            -- tables of other sessions' error
+            BEGIN
+                EXECUTE format('INSERT INTO %I.test_tmp VALUES (1);', schema_name);
+            EXCEPTION
+                WHEN feature_not_supported
+                THEN RAISE NOTICE 'cannot access temporary tables of other sessions';
+            END;
+
+            BEGIN
+                EXECUTE format('INSERT INTO %I.test_tmp VALUES (2);', schema_name);
+            EXCEPTION
+                WHEN feature_not_supported
+                THEN RAISE NOTICE 'cannot access temporary tables of other sessions';
+            END;
+
+            -- SELECT operation must fail due to 'cannot access temporary tables
+            -- of other sessions' error
+            BEGIN
+                FOR result IN
+                    EXECUTE format('SELECT * FROM %I.test_tmp;', schema_name) LOOP
+                        RAISE NOTICE '%', result;
+                    END LOOP;
+            EXCEPTION
+                WHEN feature_not_supported
+                THEN RAISE NOTICE 'cannot access temporary tables of other sessions';
+            END;
+
+            -- UPDATE operation must fail due to 'cannot access temporary tables
+            -- of other sessions' error
+            BEGIN
+                EXECUTE format('UPDATE %I.test_tmp SET id = 100 WHERE id = 3;', schema_name);
+            EXCEPTION
+                WHEN feature_not_supported
+                THEN RAISE NOTICE 'cannot access temporary tables of other sessions';
+            END;
+
+            -- DELETE operation must fail due to 'cannot access temporary tables
+            -- of other sessions' error
+            BEGIN
+                EXECUTE format('DELETE FROM %I.test_tmp WHERE id = 3;', schema_name);
+            EXCEPTION
+                WHEN feature_not_supported
+                THEN RAISE NOTICE 'cannot access temporary tables of other sessions';
+            END;
+
+            -- LOCK operation must fail due to 'cannot access temporary tables
+            -- of other sessions' error
+            BEGIN
+                EXECUTE format('BEGIN;
+                                LOCK TABLE %I.test_tmp;
+                                COMMIT;',
+                                schema_name);
+            EXCEPTION
+                WHEN feature_not_supported
+                THEN RAISE NOTICE 'cannot access temporary tables of other sessions';
+            END;
+
+            -- DROP operation must fail due to 'cannot access temporary tables
+            -- of other sessions' error
+            BEGIN
+                EXECUTE format('DROP TABLE %I.test_tmp;', schema_name);
+            EXCEPTION
+                WHEN feature_not_supported
+                THEN RAISE NOTICE 'cannot access temporary tables of other sessions';
+            END;
+        END
+    $$;
+

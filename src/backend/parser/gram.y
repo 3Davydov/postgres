@@ -19184,7 +19184,11 @@ makeRangeVarFromAnyName(List *names, int position, core_yyscan_t yyscanner)
 			break;
 	}
 
-	r->relpersistence = RELPERSISTENCE_PERMANENT;
+	if (r->schemaname && strncmp(r->schemaname, "pg_temp", 7) == 0)
+		r->relpersistence = RELPERSISTENCE_TEMP;
+	else
+		r->relpersistence = RELPERSISTENCE_PERMANENT;
+
 	r->location = position;
 
 	return r;
@@ -19223,6 +19227,11 @@ makeRangeVarFromQualifiedName(char *name, List *namelist, int location,
 						   parser_errposition(location));
 			break;
 	}
+
+	if (r->schemaname && strncmp(r->schemaname, "pg_temp", 7) == 0)
+		r->relpersistence = RELPERSISTENCE_TEMP;
+	else
+		r->relpersistence = RELPERSISTENCE_PERMANENT;
 
 	return r;
 }
