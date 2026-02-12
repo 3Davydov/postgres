@@ -820,8 +820,11 @@ ExecCheckXactReadOnly(PlannedStmt *plannedstmt)
 	}
 
 	if ((plannedstmt->commandType != CMD_SELECT &&
-		 !IsModifySupportedInParallelMode(plannedstmt->commandType)) || plannedstmt->hasModifyingCTE)
+		 !IsModifySupportedInParallelMode(plannedstmt->commandType)) ||
+		 								  plannedstmt->hasModifyingCTE)
+	{
 		PreventCommandIfParallelMode(CreateCommandName((Node *) plannedstmt));
+	}
 }
 
 
@@ -1700,7 +1703,8 @@ ExecutePlan(QueryDesc *queryDesc,
 			IsA(planstate, GatherState) &&
 			IsA(outerPlanState(planstate), ModifyTableState);
 
-		PrepareParallelModePlanExec(estate->es_plannedstmt->commandType, isParallelModifyLeader);
+		PrepareParallelModePlanExec(estate->es_plannedstmt->commandType,
+									isParallelModifyLeader);
 		EnterParallelMode();
 	}
 

@@ -57,7 +57,7 @@ ExecInitGather(Gather *node, EState *estate, int eflags)
 	GatherState *gatherstate;
 	Plan	   *outerNode;
 	TupleDesc	tupDesc;
-	Index		varno;
+	Index		varno = OUTER_VAR;
 
 	/* Gather node doesn't have innerPlan node. */
 	Assert(innerPlan(node) == NULL);
@@ -102,8 +102,16 @@ ExecInitGather(Gather *node, EState *estate, int eflags)
 	 * Initialize result type and projection.
 	 */
 	ExecInitResultTypeTL(&gatherstate->ps);
-	varno = (IsA(outerNode, ModifyTable) && castNode(ModifyTable, outerNode)->returningLists != NULL) ?
-		castNode(ModifyTableState, outerPlanState(gatherstate))->resultRelInfo->ri_RangeTableIndex : OUTER_VAR;
+
+	if (IsA(outerNode, ModifyTable) &&
+		castNode(ModifyTable, outerNode)->returningLists != NULL)
+	{
+		ModifyTableState *mtstate =
+			castNode(ModifyTableState, outerPlanState(gatherstate));
+
+		varno = mtstate->resultRelInfo->ri_RangeTableIndex;
+	}
+
 	ExecConditionalAssignProjectionInfo(&gatherstate->ps, tupDesc, varno);
 
 	/*
@@ -144,7 +152,7 @@ ExecGather(PlanState *pstate)
 	GatherState *node = castNode(GatherState, pstate);
 	TupleTableSlot *slot;
 	ExprContext *econtext;
-	ModifyTableState *nodeModifyTableState = NULL;
+	ModifyTableState *mtstate = NULL;
 	bool		isModify = false;
 	bool		isModifyWithReturning = false;
 
@@ -152,9 +160,9 @@ ExecGather(PlanState *pstate)
 
 	if (IsA(outerPlanState(pstate), ModifyTableState))
 	{
-		nodeModifyTableState = castNode(ModifyTableState, outerPlanState(pstate));
-		isModify = IsModifySupportedInParallelMode(nodeModifyTableState->operation);
-		isModifyWithReturning = isModify && nodeModifyTableState->ps.plan->targetlist != NIL;
+		mtstate = castNode(ModifyTableState, outerPlanState(pstate));
+		isModify = IsModifySupportedInParallelMode(mtstate->operation);
+		isModifyWithReturning = isModify && mtstate->ps.plan->targetlist != NIL;
 	}
 
 	/*
@@ -195,7 +203,7 @@ ExecGather(PlanState *pstate)
 				 * there are BEFORE STATEMENT triggers, these must be fired by
 				 * the leader, not by the parallel workers.
 				 */
-				fireBSTriggersInLeader(nodeModifyTableState);
+				fireBSTriggersInLeader(mtstate);
 			}
 
 			/*
@@ -446,7 +454,7 @@ ExecShutdownGatherWorkers(GatherState *node)
 void
 ExecShutdownGather(GatherState *node)
 {
-	bool		isModify;
+	ModifyTableState *mtstate = NULL;
 
 	/*
 	 * If the parallel context has already been destroyed, this function must
@@ -455,19 +463,19 @@ ExecShutdownGather(GatherState *node)
 	if (node->pei == NULL)
 		return;
 
-	isModify = IsA(outerPlanState(node), ModifyTableState) &&
-	IsModifySupportedInParallelMode(castNode(ModifyTableState, outerPlanState(node))->operation);
-
-	if (isModify)
+	if (IsA(outerPlanState(node), ModifyTableState))
 	{
-		/*
-		 * For a supported parallel table-modification command, if there are
-		 * AFTER STATEMENT triggers, these must be fired by the leader, not by
-		 * the parallel workers.
-		 */
-		ModifyTableState *nodeModifyTableState = castNode(ModifyTableState, outerPlanState(node));
+		mtstate = castNode(ModifyTableState, outerPlanState(node));
 
-		fireASTriggersInLeader(nodeModifyTableState);
+		if (IsModifySupportedInParallelMode(mtstate->operation))
+		{
+			/*
+			 * For a supported parallel table-modification command, if there are
+			 * AFTER STATEMENT triggers, these must be fired by the leader, not by
+			 * the parallel workers.
+			 */
+			fireASTriggersInLeader(mtstate);
+		}
 	}
 
 	ExecShutdownGatherWorkers(node);

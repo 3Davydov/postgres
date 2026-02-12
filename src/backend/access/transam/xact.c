@@ -541,7 +541,9 @@ GetCurrentFullTransactionIdIfAny(void)
 void
 SetCurrentCommandIdUsedForWorker(void)
 {
-	Assert(IsParallelWorker() && !currentCommandIdUsed && currentCommandId != InvalidCommandId);
+	Assert(IsParallelWorker() &&
+		   !currentCommandIdUsed &&
+		   currentCommandId != InvalidCommandId);
 
 	currentCommandIdUsed = true;
 }

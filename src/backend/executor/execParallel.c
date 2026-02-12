@@ -811,8 +811,8 @@ ExecInitParallelPlan(PlanState *planstate, EState *estate,
 		 * Allocate space for each worker's returned "# of tuples processed"
 		 * count.
 		 */
-		pei->processed_count = shm_toc_allocate(pcxt->toc,
-												 mul_size(sizeof(uint64), pcxt->nworkers));
+		pei->processed_count =
+			shm_toc_allocate(pcxt->toc, mul_size(sizeof(uint64), pcxt->nworkers));
 		shm_toc_insert(pcxt->toc, PARALLEL_KEY_PROCESSED_COUNT, pei->processed_count);
 	}
 	else
@@ -1489,7 +1489,9 @@ ParallelQueryMain(dsm_segment *seg, shm_toc *toc)
 										 true);
 	queryDesc = ExecParallelGetQueryDesc(toc, receiver, instrument_options);
 
-	Assert(queryDesc->operation == CMD_SELECT || IsModifySupportedInParallelMode(queryDesc->operation));
+	Assert(queryDesc->operation == CMD_SELECT ||
+		   IsModifySupportedInParallelMode(queryDesc->operation));
+
 	if (IsModifySupportedInParallelMode(queryDesc->operation))
 	{
 		/*
