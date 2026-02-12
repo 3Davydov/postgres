@@ -162,6 +162,9 @@ EXPLAIN SELECT * FROM pgbench_accounts WHERE filler LIKE '%x%';
             <para><command>REFRESH MATERIALIZED VIEW</command></para>
           </listitem>
         </itemizedlist>
+        Another exception is the command <literal>INSERT INTO ... SELECT ...</literal>
+        which can use a parallel plan for the underlying <literal>SELECT</literal>
+        part of the query.
       </para>
     </listitem>
 

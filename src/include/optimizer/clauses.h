@@ -52,6 +52,7 @@ extern void CommuteOpExpr(OpExpr *clause);
 
 extern Query *inline_set_returning_function(PlannerInfo *root,
 											RangeTblEntry *rte);
+extern bool is_parallel_allowed_for_modify(Query *parse);
 
 extern Bitmapset *pull_paramids(Expr *expr);
 
