@@ -131,6 +131,9 @@ typedef struct
 /* Local functions */
 static Node *preprocess_expression(PlannerInfo *root, Node *expr, int kind);
 static void preprocess_qual_conditions(PlannerInfo *root, Node *jtnode);
+static Path *generate_final_rel_path(PlannerInfo *root, RelOptInfo *final_rel,
+						Path *path, int64 offset_est,
+						int64 count_est, bool isParallelModify);
 static void grouping_planner(PlannerInfo *root, double tuple_fraction,
 							 SetOperationStmt *setops);
 static grouping_sets_data *preprocess_grouping_sets(PlannerInfo *root);
@@ -353,10 +356,11 @@ standard_planner(Query *parse, const char *query_string, int cursorOptions,
 	 *
 	 * (Note that we do allow CREATE TABLE AS, INSERT INTO...SELECT, SELECT
 	 * INTO, and CREATE MATERIALIZED VIEW to use parallel plans. However, as
-	 * of now, only the leader backend writes into a completely new table. In
-	 * the future, we can extend it to allow workers to write into the table.
-	 * However, to allow parallel updates and deletes, we have to solve other
-	 * problems, especially around combo CIDs.)
+	 * of now, only INSERT INTO...SELECT employs workers to write into the
+	 * table, while for the other cases only the leader backend writes into a
+	 * completely new table. In the future, we can extend it to allow workers
+	 * for more cases. However, to allow parallel updates and deletes, we have
+	 * to solve other problems, especially around combo CIDs.)
 	 *
 	 * For now, we don't try to use parallel mode if we're running inside a
 	 * parallel worker.  We might eventually be able to relax this
@@ -1446,6 +1450,7 @@ grouping_planner(PlannerInfo *root, double tuple_fraction,
 	RelOptInfo *final_rel;
 	FinalPathExtraData extra;
 	ListCell   *lc;
+	bool		parallel_modify_partial_path_added = false;
 
 	/* Tweak caller-supplied tuple_fraction if have LIMIT/OFFSET */
 	if (parse->limitCount || parse->limitOffset)
@@ -1894,239 +1899,31 @@ grouping_planner(PlannerInfo *root, double tuple_fraction,
 	{
 		Path	   *path = (Path *) lfirst(lc);
 
-		/*
-		 * If there is a FOR [KEY] UPDATE/SHARE clause, add the LockRows node.
-		 * (Note: we intentionally test parse->rowMarks not root->rowMarks
-		 * here.  If there are only non-locking rowmarks, they should be
-		 * handled by the ModifyTable node instead.  However, root->rowMarks
-		 * is what goes into the LockRows node.)
-		 */
-		if (parse->rowMarks)
-		{
-			path = (Path *) create_lockrows_path(root, final_rel, path,
-												 root->rowMarks,
-												 assign_special_exec_param(root));
-		}
-
-		/*
-		 * If there is a LIMIT/OFFSET clause, add the LIMIT node.
-		 */
-		if (limit_needed(parse))
-		{
-			path = (Path *) create_limit_path(root, final_rel, path,
-											  parse->limitOffset,
-											  parse->limitCount,
-											  parse->limitOption,
-											  offset_est, count_est);
-		}
-
-		/*
-		 * If this is an INSERT/UPDATE/DELETE/MERGE, add the ModifyTable node.
-		 */
-		if (parse->commandType != CMD_SELECT)
-		{
-			Index		rootRelation;
-			List	   *resultRelations = NIL;
-			List	   *updateColnosLists = NIL;
-			List	   *withCheckOptionLists = NIL;
-			List	   *returningLists = NIL;
-			List	   *mergeActionLists = NIL;
-			List	   *mergeJoinConditions = NIL;
-			List	   *rowMarks;
-
-			if (bms_membership(root->all_result_relids) == BMS_MULTIPLE)
-			{
-				/* Inherited UPDATE/DELETE/MERGE */
-				RelOptInfo *top_result_rel = find_base_rel(root,
-														   parse->resultRelation);
-				int			resultRelation = -1;
-
-				/* Pass the root result rel forward to the executor. */
-				rootRelation = parse->resultRelation;
-
-				/* Add only leaf children to ModifyTable. */
-				while ((resultRelation = bms_next_member(root->leaf_result_relids,
-														 resultRelation)) >= 0)
-				{
-					RelOptInfo *this_result_rel = find_base_rel(root,
-																resultRelation);
-
-					/*
-					 * Also exclude any leaf rels that have turned dummy since
-					 * being added to the list, for example, by being excluded
-					 * by constraint exclusion.
-					 */
-					if (IS_DUMMY_REL(this_result_rel))
-						continue;
-
-					/* Build per-target-rel lists needed by ModifyTable */
-					resultRelations = lappend_int(resultRelations,
-												  resultRelation);
-					if (parse->commandType == CMD_UPDATE)
-					{
-						List	   *update_colnos = root->update_colnos;
-
-						if (this_result_rel != top_result_rel)
-							update_colnos =
-								adjust_inherited_attnums_multilevel(root,
-																	update_colnos,
-																	this_result_rel->relid,
-																	top_result_rel->relid);
-						updateColnosLists = lappend(updateColnosLists,
-													update_colnos);
-					}
-					if (parse->withCheckOptions)
-					{
-						List	   *withCheckOptions = parse->withCheckOptions;
-
-						if (this_result_rel != top_result_rel)
-							withCheckOptions = (List *)
-								adjust_appendrel_attrs_multilevel(root,
-																  (Node *) withCheckOptions,
-																  this_result_rel,
-																  top_result_rel);
-						withCheckOptionLists = lappend(withCheckOptionLists,
-													   withCheckOptions);
-					}
-					if (parse->returningList)
-					{
-						List	   *returningList = parse->returningList;
-
-						if (this_result_rel != top_result_rel)
-							returningList = (List *)
-								adjust_appendrel_attrs_multilevel(root,
-																  (Node *) returningList,
-																  this_result_rel,
-																  top_result_rel);
-						returningLists = lappend(returningLists,
-												 returningList);
-					}
-					if (parse->mergeActionList)
-					{
-						ListCell   *l;
-						List	   *mergeActionList = NIL;
-
-						/*
-						 * Copy MergeActions and translate stuff that
-						 * references attribute numbers.
-						 */
-						foreach(l, parse->mergeActionList)
-						{
-							MergeAction *action = lfirst(l),
-									   *leaf_action = copyObject(action);
-
-							leaf_action->qual =
-								adjust_appendrel_attrs_multilevel(root,
-																  (Node *) action->qual,
-																  this_result_rel,
-																  top_result_rel);
-							leaf_action->targetList = (List *)
-								adjust_appendrel_attrs_multilevel(root,
-																  (Node *) action->targetList,
-																  this_result_rel,
-																  top_result_rel);
-							if (leaf_action->commandType == CMD_UPDATE)
-								leaf_action->updateColnos =
-									adjust_inherited_attnums_multilevel(root,
-																		action->updateColnos,
-																		this_result_rel->relid,
-																		top_result_rel->relid);
-							mergeActionList = lappend(mergeActionList,
-													  leaf_action);
-						}
-
-						mergeActionLists = lappend(mergeActionLists,
-												   mergeActionList);
-					}
-					if (parse->commandType == CMD_MERGE)
-					{
-						Node	   *mergeJoinCondition = parse->mergeJoinCondition;
-
-						if (this_result_rel != top_result_rel)
-							mergeJoinCondition =
-								adjust_appendrel_attrs_multilevel(root,
-																  mergeJoinCondition,
-																  this_result_rel,
-																  top_result_rel);
-						mergeJoinConditions = lappend(mergeJoinConditions,
-													  mergeJoinCondition);
-					}
-				}
-
-				if (resultRelations == NIL)
-				{
-					/*
-					 * We managed to exclude every child rel, so generate a
-					 * dummy one-relation plan using info for the top target
-					 * rel (even though that may not be a leaf target).
-					 * Although it's clear that no data will be updated or
-					 * deleted, we still need to have a ModifyTable node so
-					 * that any statement triggers will be executed.  (This
-					 * could be cleaner if we fixed nodeModifyTable.c to allow
-					 * zero target relations, but that probably wouldn't be a
-					 * net win.)
-					 */
-					resultRelations = list_make1_int(parse->resultRelation);
-					if (parse->commandType == CMD_UPDATE)
-						updateColnosLists = list_make1(root->update_colnos);
-					if (parse->withCheckOptions)
-						withCheckOptionLists = list_make1(parse->withCheckOptions);
-					if (parse->returningList)
-						returningLists = list_make1(parse->returningList);
-					if (parse->mergeActionList)
-						mergeActionLists = list_make1(parse->mergeActionList);
-					if (parse->commandType == CMD_MERGE)
-						mergeJoinConditions = list_make1(parse->mergeJoinCondition);
-				}
-			}
-			else
-			{
-				/* Single-relation INSERT/UPDATE/DELETE/MERGE. */
-				rootRelation = 0;	/* there's no separate root rel */
-				resultRelations = list_make1_int(parse->resultRelation);
-				if (parse->commandType == CMD_UPDATE)
-					updateColnosLists = list_make1(root->update_colnos);
-				if (parse->withCheckOptions)
-					withCheckOptionLists = list_make1(parse->withCheckOptions);
-				if (parse->returningList)
-					returningLists = list_make1(parse->returningList);
-				if (parse->mergeActionList)
-					mergeActionLists = list_make1(parse->mergeActionList);
-				if (parse->commandType == CMD_MERGE)
-					mergeJoinConditions = list_make1(parse->mergeJoinCondition);
-			}
-
-			/*
-			 * If there was a FOR [KEY] UPDATE/SHARE clause, the LockRows node
-			 * will have dealt with fetching non-locked marked rows, else we
-			 * need to have ModifyTable do that.
-			 */
-			if (parse->rowMarks)
-				rowMarks = NIL;
-			else
-				rowMarks = root->rowMarks;
-
-			path = (Path *)
-				create_modifytable_path(root, final_rel,
-										path,
-										parse->commandType,
-										parse->canSetTag,
-										parse->resultRelation,
-										rootRelation,
-										root->partColsUpdated,
-										resultRelations,
-										updateColnosLists,
-										withCheckOptionLists,
-										returningLists,
-										rowMarks,
-										parse->onConflict,
-										mergeActionLists,
-										mergeJoinConditions,
-										assign_special_exec_param(root));
-		}
+		path = generate_final_rel_path(root, final_rel, path, offset_est, count_est, false);
 
 		/* And shove it into final_rel */
 		add_path(final_rel, path);
+	}
+
+	/* Consider a supported parallel table-modification command */
+	if (IsModifySupportedInParallelMode(parse->commandType) &&
+		final_rel->consider_parallel &&
+		parse->rowMarks == NIL)
+	{
+		/*
+		 * Generate partial paths for the final_rel. Insert all surviving
+		 * paths, with Limit, and/or ModifyTable steps added if needed.
+		 */
+		foreach(lc, current_rel->partial_pathlist)
+		{
+			Path	   *path = (Path *) lfirst(lc);
+
+			path = generate_final_rel_path(root, final_rel, path,
+										offset_est, count_est, true);
+
+			add_partial_path(final_rel, path);
+			parallel_modify_partial_path_added = true;
+		}
 	}
 
 	/*
@@ -2143,6 +1940,18 @@ grouping_planner(PlannerInfo *root, double tuple_fraction,
 
 			add_partial_path(final_rel, partial_path);
 		}
+	}
+
+	if (parallel_modify_partial_path_added)
+	{
+		/*
+		 * Generate gather paths according to the added partial paths for the
+		 * parallel table-modification command.
+		 * Note that true is passed for the "override_rows" parameter, so that
+		 * the rows from the cheapest partial path (ModifyTablePath) are used,
+		 * not the rel's (possibly estimated) rows.
+		 */
+		generate_useful_gather_paths(root, final_rel, true);
 	}
 
 	extra.limit_needed = limit_needed(parse);
@@ -8032,7 +7841,33 @@ apply_scanjoin_target_to_paths(PlannerInfo *root,
 	 * one of the generated paths may turn out to be the cheapest one.
 	 */
 	if (rel->consider_parallel && !IS_OTHER_REL(rel))
-		generate_useful_gather_paths(root, rel, false);
+	{
+		if (IsModifySupportedInParallelMode(root->parse->commandType))
+		{
+			Assert(root->glob->parallelModeOK);
+			if (root->glob->maxParallelHazard != PROPARALLEL_SAFE)
+			{
+				/*
+				 * Don't allow a supported parallel table-modification
+				 * command, because it's not safe.
+				 */
+				if (root->glob->maxParallelHazard == PROPARALLEL_RESTRICTED)
+				{
+					/*
+					 * However, do allow any underlying query to be run by
+					 * parallel workers.
+					 */
+					generate_useful_gather_paths(root, rel, false);
+				}
+				rel->partial_pathlist = NIL;
+				rel->consider_parallel = false;
+			}
+		}
+		else
+		{
+			generate_useful_gather_paths(root, rel, false);
+		}
+	}
 
 	/*
 	 * Reassess which paths are the cheapest, now that we've potentially added
@@ -8334,4 +8169,254 @@ generate_setop_child_grouplist(SetOperationStmt *op, List *targetlist)
 	Assert(ct == NULL);
 
 	return grouplist;
+}
+
+/*
+ * generate_final_rel_path
+ *     Generate a path for the final_rel, with LockRows, Limit, and/or
+ *     ModifyTable steps added if needed.
+ */
+static Path *
+generate_final_rel_path(PlannerInfo *root, RelOptInfo *final_rel,
+						Path *path,
+						int64 offset_est, int64 count_est, bool isParallelModify)
+{
+	Index		rootRelation;
+	List	   *resultRelations = NIL;
+	List	   *updateColnosLists = NIL;
+	List	   *withCheckOptionLists = NIL;
+	List	   *returningLists = NIL;
+	List	   *mergeActionLists = NIL;
+	List	   *mergeJoinConditions = NIL;
+	List	   *rowMarks;
+	int			parallelWorkers;
+	Query	   *parse = root->parse;
+
+	/*
+	 * If there is a FOR [KEY] UPDATE/SHARE clause, add the LockRows node.
+	 * (Note: we intentionally test parse->rowMarks not root->rowMarks
+	 * here.  If there are only non-locking rowmarks, they should be
+	 * handled by the ModifyTable node instead.  However, root->rowMarks
+	 * is what goes into the LockRows node.)
+	 */
+	if (parse->rowMarks)
+	{
+		path = (Path *) create_lockrows_path(root, final_rel, path,
+											 root->rowMarks,
+											 assign_special_exec_param(root));
+	}
+
+	/*
+	 * If there is a LIMIT/OFFSET clause, add the LIMIT node.
+	 */
+	if (limit_needed(parse))
+	{
+		path = (Path *) create_limit_path(root, final_rel, path,
+										  parse->limitOffset,
+										  parse->limitCount,
+										  parse->limitOption,
+										  offset_est, count_est);
+	}
+
+	if (parse->commandType == CMD_SELECT)
+		return path;
+
+	/*
+	 * If this is an INSERT/UPDATE/DELETE/MERGE, add the ModifyTable node.
+	 */
+
+	if (bms_membership(root->all_result_relids) == BMS_MULTIPLE)
+	{
+		/* Inherited UPDATE/DELETE/MERGE */
+		RelOptInfo *top_result_rel = find_base_rel(root,
+												   parse->resultRelation);
+		int			resultRelation = -1;
+
+		/* Pass the root result rel forward to the executor. */
+		rootRelation = parse->resultRelation;
+
+		/* Add only leaf children to ModifyTable. */
+		while ((resultRelation = bms_next_member(root->leaf_result_relids,
+												 resultRelation)) >= 0)
+		{
+			RelOptInfo *this_result_rel = find_base_rel(root,
+														resultRelation);
+
+			/*
+			 * Also exclude any leaf rels that have turned dummy since
+			 * being added to the list, for example, by being excluded
+			 * by constraint exclusion.
+			 */
+			if (IS_DUMMY_REL(this_result_rel))
+				continue;
+
+			/* Build per-target-rel lists needed by ModifyTable */
+			resultRelations = lappend_int(resultRelations,
+										  resultRelation);
+			if (parse->commandType == CMD_UPDATE)
+			{
+				List	   *update_colnos = root->update_colnos;
+
+				if (this_result_rel != top_result_rel)
+					update_colnos =
+						adjust_inherited_attnums_multilevel(root,
+															update_colnos,
+															this_result_rel->relid,
+															top_result_rel->relid);
+				updateColnosLists = lappend(updateColnosLists,
+											update_colnos);
+			}
+			if (parse->withCheckOptions)
+			{
+				List	   *withCheckOptions = parse->withCheckOptions;
+
+				if (this_result_rel != top_result_rel)
+					withCheckOptions = (List *)
+						adjust_appendrel_attrs_multilevel(root,
+														  (Node *) withCheckOptions,
+														  this_result_rel,
+														  top_result_rel);
+				withCheckOptionLists = lappend(withCheckOptionLists,
+											   withCheckOptions);
+			}
+			if (parse->returningList)
+			{
+				List	   *returningList = parse->returningList;
+
+				if (this_result_rel != top_result_rel)
+					returningList = (List *)
+						adjust_appendrel_attrs_multilevel(root,
+														  (Node *) returningList,
+														  this_result_rel,
+														  top_result_rel);
+				returningLists = lappend(returningLists,
+										 returningList);
+			}
+			if (parse->mergeActionList)
+			{
+				ListCell   *l;
+				List	   *mergeActionList = NIL;
+
+				/*
+				 * Copy MergeActions and translate stuff that
+				 * references attribute numbers.
+				 */
+				foreach(l, parse->mergeActionList)
+				{
+					MergeAction *action = lfirst(l),
+							   *leaf_action = copyObject(action);
+
+					leaf_action->qual =
+						adjust_appendrel_attrs_multilevel(root,
+														  (Node *) action->qual,
+														  this_result_rel,
+														  top_result_rel);
+					leaf_action->targetList = (List *)
+						adjust_appendrel_attrs_multilevel(root,
+														  (Node *) action->targetList,
+														  this_result_rel,
+														  top_result_rel);
+					if (leaf_action->commandType == CMD_UPDATE)
+						leaf_action->updateColnos =
+							adjust_inherited_attnums_multilevel(root,
+																action->updateColnos,
+																this_result_rel->relid,
+																top_result_rel->relid);
+					mergeActionList = lappend(mergeActionList,
+											  leaf_action);
+				}
+
+				mergeActionLists = lappend(mergeActionLists,
+										   mergeActionList);
+			}
+			if (parse->commandType == CMD_MERGE)
+			{
+				Node	   *mergeJoinCondition = parse->mergeJoinCondition;
+
+				if (this_result_rel != top_result_rel)
+					mergeJoinCondition =
+						adjust_appendrel_attrs_multilevel(root,
+														  mergeJoinCondition,
+														  this_result_rel,
+														  top_result_rel);
+				mergeJoinConditions = lappend(mergeJoinConditions,
+											  mergeJoinCondition);
+			}
+		}
+
+		if (resultRelations == NIL)
+		{
+			/*
+			 * We managed to exclude every child rel, so generate a
+			 * dummy one-relation plan using info for the top target
+			 * rel (even though that may not be a leaf target).
+			 * Although it's clear that no data will be updated or
+			 * deleted, we still need to have a ModifyTable node so
+			 * that any statement triggers will be executed.  (This
+			 * could be cleaner if we fixed nodeModifyTable.c to allow
+			 * zero target relations, but that probably wouldn't be a
+			 * net win.)
+			 */
+			resultRelations = list_make1_int(parse->resultRelation);
+			if (parse->commandType == CMD_UPDATE)
+				updateColnosLists = list_make1(root->update_colnos);
+			if (parse->withCheckOptions)
+				withCheckOptionLists = list_make1(parse->withCheckOptions);
+			if (parse->returningList)
+				returningLists = list_make1(parse->returningList);
+			if (parse->mergeActionList)
+				mergeActionLists = list_make1(parse->mergeActionList);
+			if (parse->commandType == CMD_MERGE)
+				mergeJoinConditions = list_make1(parse->mergeJoinCondition);
+		}
+	}
+	else
+	{
+		/* Single-relation INSERT/UPDATE/DELETE/MERGE. */
+		rootRelation = 0;	/* there's no separate root rel */
+		resultRelations = list_make1_int(parse->resultRelation);
+		if (parse->commandType == CMD_UPDATE)
+			updateColnosLists = list_make1(root->update_colnos);
+		if (parse->withCheckOptions)
+			withCheckOptionLists = list_make1(parse->withCheckOptions);
+		if (parse->returningList)
+			returningLists = list_make1(parse->returningList);
+		if (parse->mergeActionList)
+			mergeActionLists = list_make1(parse->mergeActionList);
+		if (parse->commandType == CMD_MERGE)
+			mergeJoinConditions = list_make1(parse->mergeJoinCondition);
+	}
+
+	/*
+	 * If there was a FOR [KEY] UPDATE/SHARE clause, the LockRows node
+	 * will have dealt with fetching non-locked marked rows, else we
+	 * need to have ModifyTable do that.
+	 */
+	if (parse->rowMarks)
+		rowMarks = NIL;
+	else
+		rowMarks = root->rowMarks;
+
+	parallelWorkers = isParallelModify ? path->parallel_workers : 0;
+
+	path = (Path *)
+		create_modifytable_path(root, final_rel,
+								path,
+								parse->commandType,
+								parse->canSetTag,
+								parse->resultRelation,
+								rootRelation,
+								root->partColsUpdated,
+								resultRelations,
+								updateColnosLists,
+								withCheckOptionLists,
+								returningLists,
+								rowMarks,
+								parse->onConflict,
+								mergeActionLists,
+								mergeJoinConditions,
+								assign_special_exec_param(root),
+								parallelWorkers);
+
+	return path;
 }

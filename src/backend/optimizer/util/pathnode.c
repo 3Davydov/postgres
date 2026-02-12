@@ -4011,6 +4011,7 @@ create_lockrows_path(PlannerInfo *root, RelOptInfo *rel,
  * 'epqParam' is the ID of Param for EvalPlanQual re-eval
  * 'mergeActionLists' is a list of lists of MERGE actions (one per rel)
  * 'mergeJoinConditions' is a list of join conditions for MERGE (one per rel)
+ * 'parallelWorkers' is the no. of parallel workers to use
  */
 ModifyTablePath *
 create_modifytable_path(PlannerInfo *root, RelOptInfo *rel,
@@ -4023,7 +4024,7 @@ create_modifytable_path(PlannerInfo *root, RelOptInfo *rel,
 						List *withCheckOptionLists, List *returningLists,
 						List *rowMarks, OnConflictExpr *onconflict,
 						List *mergeActionLists, List *mergeJoinConditions,
-						int epqParam)
+						int epqParam, int parallelWorkers)
 {
 	ModifyTablePath *pathnode = makeNode(ModifyTablePath);
 
@@ -4031,6 +4032,7 @@ create_modifytable_path(PlannerInfo *root, RelOptInfo *rel,
 		   (operation == CMD_UPDATE ?
 			list_length(resultRelations) == list_length(updateColnosLists) :
 			updateColnosLists == NIL));
+
 	Assert(withCheckOptionLists == NIL ||
 		   list_length(resultRelations) == list_length(withCheckOptionLists));
 	Assert(returningLists == NIL ||
@@ -4043,9 +4045,12 @@ create_modifytable_path(PlannerInfo *root, RelOptInfo *rel,
 	/* For now, assume we are above any joins, so no parameterization */
 	pathnode->path.param_info = NULL;
 	pathnode->path.parallel_aware = false;
-	pathnode->path.parallel_safe = false;
-	pathnode->path.parallel_workers = 0;
+	pathnode->path.parallel_workers = parallelWorkers;
 	pathnode->path.pathkeys = NIL;
+	pathnode->path.parallel_safe =
+		rel->consider_parallel &&
+		parallelWorkers > 0 &&
+		subpath->parallel_safe;
 
 	/*
 	 * Compute cost & rowcount as subpath cost & rowcount (if RETURNING)

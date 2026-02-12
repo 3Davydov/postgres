@@ -1406,7 +1406,8 @@ typedef struct ModifyTableState
 	ResultRelInfo *rootResultRelInfo;
 
 	EPQState	mt_epqstate;	/* for evaluating EvalPlanQual rechecks */
-	bool		fireBSTriggers; /* do we need to fire stmt triggers? */
+	bool		fireBSTriggers; /* do we need to fire before stmt triggers? */
+	bool		fireASTriggers; /* do we need to fire after stmt triggers? */
 
 	/*
 	 * These fields are used for inherited UPDATE and DELETE, to track which

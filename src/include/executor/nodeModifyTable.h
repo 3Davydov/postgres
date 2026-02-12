@@ -26,8 +26,10 @@ extern void ExecComputeStoredGenerated(ResultRelInfo *resultRelInfo,
 extern ModifyTableState *ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags);
 extern void ExecEndModifyTable(ModifyTableState *node);
 extern void ExecReScanModifyTable(ModifyTableState *node);
-
 extern void ExecInitMergeTupleSlots(ModifyTableState *mtstate,
 									ResultRelInfo *resultRelInfo);
+
+extern void fireBSTriggersInLeader(ModifyTableState *node);
+extern void fireASTriggersInLeader(ModifyTableState *node);
 
 #endif							/* NODEMODIFYTABLE_H */
