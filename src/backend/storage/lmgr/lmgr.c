@@ -1061,6 +1061,23 @@ ConditionalLockDatabaseObject(Oid classid, Oid objid, uint16 objsubid,
 	return true;
 }
 
+bool
+CheckDatabaseObjectLockedByMe(Oid classid, Oid objid, uint16 objsubid,
+							  LOCKMODE lockmode, bool orstronger)
+{
+	LOCKTAG		tag;
+
+	SET_LOCKTAG_OBJECT(tag,
+					   MyDatabaseId,
+					   classid,
+					   objid,
+					   objsubid);
+
+	return LockHeldByMe(&tag, lockmode, orstronger);
+}
+
+
+
 /*
  *		UnlockDatabaseObject
  */

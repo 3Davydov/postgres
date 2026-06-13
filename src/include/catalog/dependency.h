@@ -227,4 +227,15 @@ extern void shdepDropOwned(List *roleids, DropBehavior behavior);
 
 extern void shdepReassignOwned(List *roleids, Oid newrole);
 
+extern void PropagateHazardUp(Oid objid, Oid objclassid,
+							  char old_parallel_safety,
+							  char new_parallel_safety);
+extern void LockParallelDmlDependenciesForRead(void);
+extern void LockParallelDmlDependenciesForUpdate(void);
+extern bool CheckParallelDmlDependencyLockedByMe(void);
+extern void UpdateTriggerRelationsParallelHazard(Oid funcid,
+												 char new_parallel_safety);
+extern void PropagateParallelHazardFromChildToParent(Oid child_oid);
+extern char FindMaxHazardAmongTriggers(Oid relid, Relation pg_trigger_rel);
+
 #endif							/* DEPENDENCY_H */

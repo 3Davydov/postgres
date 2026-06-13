@@ -1375,6 +1375,8 @@ AlterFunction(ParseState *pstate, AlterFunctionStmt *stmt)
 	DefElem    *rows_item = NULL;
 	DefElem    *support_item = NULL;
 	DefElem    *parallel_item = NULL;
+	char		new_proparallel = 0;
+	char		old_proparallel = 0;
 	ObjectAddress address;
 
 	rel = table_open(ProcedureRelationId, RowExclusiveLock);
@@ -1483,7 +1485,17 @@ AlterFunction(ParseState *pstate, AlterFunctionStmt *stmt)
 		procForm->prosupport = newsupport;
 	}
 	if (parallel_item)
-		procForm->proparallel = interpret_func_parallel(parallel_item);
+	{
+		new_proparallel = interpret_func_parallel(parallel_item);
+		if (procForm->proparallel != new_proparallel)
+		{
+			old_proparallel = procForm->proparallel;
+			LockParallelDmlDependenciesForUpdate();
+			procForm->proparallel = new_proparallel;
+		}
+		else
+			new_proparallel = 0;
+	}
 	if (set_items)
 	{
 		Datum		datum;
@@ -1524,6 +1536,12 @@ AlterFunction(ParseState *pstate, AlterFunctionStmt *stmt)
 	CatalogTupleUpdate(rel, &tup->t_self, tup);
 
 	InvokeObjectPostAlterHook(ProcedureRelationId, funcOid, 0);
+
+	if (ProparallelIsValid(new_proparallel))
+	{
+		Assert(ProparallelIsValid(old_proparallel));
+		UpdateTriggerRelationsParallelHazard(funcOid, new_proparallel);
+	}
 
 	table_close(rel, NoLock);
 	heap_freetuple(tup);

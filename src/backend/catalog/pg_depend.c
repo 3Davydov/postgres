@@ -17,16 +17,22 @@
 #include "access/genam.h"
 #include "access/htup_details.h"
 #include "access/table.h"
+#include "access/xact.h"
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
+#include "catalog/pg_attrdef.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_depend.h"
 #include "catalog/pg_extension.h"
+#include "catalog/pg_proc.h"
+#include "catalog/pg_trigger.h"
 #include "catalog/pg_type.h"
 #include "catalog/partition.h"
 #include "commands/extension.h"
 #include "miscadmin.h"
+#include "storage/lmgr.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
@@ -34,6 +40,14 @@
 
 
 static bool isObjectPinned(const ObjectAddress *object);
+static HeapTuple get_trigger_tuple(Relation tgrel, Oid trigOid);
+static List *get_trigger_relation_oids(Oid funcid);
+
+/*
+ * A synthetic object lock serializing changes to the part of the dependency
+ * graph used to maintain pg_class.relparalleldml.
+ */
+#define PARALLEL_DML_DEPENDENCY_LOCK_ID InvalidOid
 
 
 /*
@@ -1161,4 +1175,193 @@ get_index_ref_constraints(Oid indexId)
 	table_close(depRel, AccessShareLock);
 
 	return result;
+}
+
+void
+LockParallelDmlDependenciesForRead(void)
+{
+	LockDatabaseObject(DependRelationId, PARALLEL_DML_DEPENDENCY_LOCK_ID, 0,
+					   AccessShareLock);
+}
+
+void
+LockParallelDmlDependenciesForUpdate(void)
+{
+	LockDatabaseObject(DependRelationId, PARALLEL_DML_DEPENDENCY_LOCK_ID, 0,
+					   AccessExclusiveLock);
+}
+
+bool
+CheckParallelDmlDependencyLockedByMe(void)
+{
+	return CheckDatabaseObjectLockedByMe(DependRelationId,
+										 PARALLEL_DML_DEPENDENCY_LOCK_ID,
+										 0, AccessShareLock, true);
+}
+
+/*
+ * Fetch a copy of pg_trigger tuple by OID.
+ */
+static HeapTuple
+get_trigger_tuple(Relation tgrel, Oid trigOid)
+{
+	ScanKeyData key[1];
+	SysScanDesc scan;
+	HeapTuple	tup;
+	HeapTuple	result = NULL;
+
+	ScanKeyInit(&key[0],
+				Anum_pg_trigger_oid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(trigOid));
+
+	scan = systable_beginscan(tgrel, TriggerOidIndexId, true,
+							  NULL, 1, key);
+
+	tup = systable_getnext(scan);
+	if (HeapTupleIsValid(tup))
+		result = heap_copytuple(tup);
+
+	systable_endscan(scan);
+
+	return result;
+}
+
+/*
+ * Return relations that have triggers depending on funcid.
+ */
+static List *
+get_trigger_relation_oids(Oid funcid)
+{
+	List	   *relids = NIL;
+	Relation	depRel;
+	Relation	tgrel;
+	ScanKeyData key[2];
+	SysScanDesc scan;
+	HeapTuple	tup;
+
+	depRel = table_open(DependRelationId, AccessShareLock);
+	tgrel = table_open(TriggerRelationId, AccessShareLock);
+
+	ScanKeyInit(&key[0],
+				Anum_pg_depend_refclassid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(ProcedureRelationId));
+	ScanKeyInit(&key[1],
+				Anum_pg_depend_refobjid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(funcid));
+
+	scan = systable_beginscan(depRel, DependReferenceIndexId, true,
+							  NULL, 2, key);
+
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		Form_pg_depend depform = (Form_pg_depend) GETSTRUCT(tup);
+		HeapTuple	trigtup;
+		Oid			relid;
+
+		if (depform->classid != TriggerRelationId ||
+			depform->objsubid != 0)
+			continue;
+
+		trigtup = get_trigger_tuple(tgrel, depform->objid);
+		if (!HeapTupleIsValid(trigtup))
+			elog(ERROR, "could not find tuple for trigger %u",
+				 depform->objid);
+
+		relid = ((Form_pg_trigger) GETSTRUCT(trigtup))->tgrelid;
+		if (!list_member_oid(relids, relid))
+			relids = lappend_oid(relids, relid);
+
+		heap_freetuple(trigtup);
+	}
+
+	systable_endscan(scan);
+	table_close(tgrel, AccessShareLock);
+	table_close(depRel, AccessShareLock);
+
+	list_sort(relids, list_oid_cmp);
+	return relids;
+}
+
+/*
+ * Update relparalleldml for all tables whose triggers use funcid.
+ *
+ * At the moment this only accounts for table -> trigger -> function
+ * dependencies.
+ */
+void
+UpdateTriggerRelationsParallelHazard(Oid funcid, char new_parallel)
+{
+	List	   *relids;
+	ListCell   *lc;
+	Relation	tgrel;
+	Relation	classrel;
+
+	Assert(ProparallelIsValid(new_parallel));
+
+	/* Make our proparallel change of the function visible to ourselves */
+	CommandCounterIncrement();
+
+	relids = get_trigger_relation_oids(funcid);
+	tgrel = table_open(TriggerRelationId, AccessShareLock);
+	classrel = table_open(RelationRelationId, RowExclusiveLock);
+
+	foreach(lc, relids)
+	{
+		Oid			relid = lfirst_oid(lc);
+		HeapTuple	pg_class_htup;
+		Form_pg_class classForm;
+		char	max_hazard;
+		bool	is_partition;
+		Relation rel;
+
+		pg_class_htup = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(relid));
+
+		if (!HeapTupleIsValid(pg_class_htup))
+			elog(ERROR, "cache lookup failed for relation %u",
+				 relid);
+
+		classForm = (Form_pg_class) GETSTRUCT(pg_class_htup);
+
+		if (classForm->relkind == RELKIND_FOREIGN_TABLE ||
+			classForm->relpersistence == RELPERSISTENCE_TEMP)
+		{
+			heap_freetuple(pg_class_htup);
+			continue;
+		}
+
+		max_hazard = FindMaxHazardAmongTriggers(relid, tgrel);
+
+		ereport(WARNING, errmsg("relation %s has trigger depending on altered function (max hazard = %c)",
+			classForm->relname.data, max_hazard));
+
+		if (classForm->relparalleldml == max_hazard)
+		{
+			heap_freetuple(pg_class_htup);
+			continue;
+		}
+
+		rel = table_open(relid, AccessShareLock);
+
+		classForm->relparalleldml = max_hazard;
+		CatalogTupleUpdate(classrel, &pg_class_htup->t_self,
+						   pg_class_htup);
+
+		table_close(rel, NoLock);
+
+		CommandCounterIncrement();
+
+		is_partition = classForm->relispartition;
+
+		heap_freetuple(pg_class_htup);
+
+		if (is_partition)
+			PropagateParallelHazardFromChildToParent(relid);
+	}
+
+	table_close(classrel, RowExclusiveLock);
+	table_close(tgrel, AccessShareLock);
+	list_free(relids);
 }

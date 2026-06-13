@@ -83,6 +83,9 @@ CATALOG(pg_class,1259,RelationRelationId) BKI_BOOTSTRAP BKI_ROWTYPE_OID(83,Relat
 	/* see RELPERSISTENCE_xxx constants below */
 	char		relpersistence BKI_DEFAULT(p);
 
+	/* parallel safety of the dml on the relation */
+	char		relparalleldml BKI_DEFAULT(s);
+
 	/* see RELKIND_xxx constants below */
 	char		relkind BKI_DEFAULT(r);
 

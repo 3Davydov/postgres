@@ -1215,3 +1215,37 @@ oid_array_to_list(Datum datum)
 		result = lappend_oid(result, values[i]);
 	return result;
 }
+
+/*
+ * Returns true iff proparallel1 < proparallel2 (i.e. has lower hazard).
+ */
+bool
+hazard_precedes(char proparallel1, char proparallel2)
+{
+	if (!ProparallelIsValid(proparallel2))
+		elog(ERROR, "unrecognized proparallel value \"%c\"", proparallel2);
+
+	switch (proparallel1)
+	{
+		case PROPARALLEL_SAFE:
+			return (proparallel2 != PROPARALLEL_SAFE);
+		case PROPARALLEL_RESTRICTED:
+			return (proparallel2 == PROPARALLEL_UNSAFE);
+		case PROPARALLEL_UNSAFE:
+			return false;
+		default:
+			elog(ERROR, "unrecognized proparallel value \"%c\"", proparallel1);
+			break;
+	}
+}
+
+/*
+ * Returns true iff proparallel1 <= proparallel2 (i.e. has lower or the same
+ * hazard).
+ */
+bool
+hazard_precedes_or_equals(char proparallel1, char proparallel2)
+{
+	return (proparallel1 == proparallel2 ||
+			hazard_precedes(proparallel1, proparallel2));
+}

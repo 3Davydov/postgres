@@ -714,6 +714,7 @@ make_new_heap(Oid OIDOldHeap, Oid NewTableSpace, Oid NewAccessMethod,
 	Datum		reloptions;
 	bool		isNull;
 	Oid			namespaceid;
+	char		relparalleldml;
 
 	OldHeap = table_open(OIDOldHeap, lockmode);
 	OldHeapDesc = RelationGetDescr(OldHeap);
@@ -755,6 +756,11 @@ make_new_heap(Oid OIDOldHeap, Oid NewTableSpace, Oid NewAccessMethod,
 	 */
 	snprintf(NewHeapName, sizeof(NewHeapName), "pg_temp_%u", OIDOldHeap);
 
+	relparalleldml = SysCacheGetAttr(RELOID, tuple,
+									 Anum_pg_class_relparalleldml,
+								 	 &isNull);
+	Assert(!isNull);
+
 	OIDNewHeap = heap_create_with_catalog(NewHeapName,
 										  namespaceid,
 										  NewTableSpace,
@@ -767,6 +773,7 @@ make_new_heap(Oid OIDOldHeap, Oid NewTableSpace, Oid NewAccessMethod,
 										  NIL,
 										  RELKIND_RELATION,
 										  relpersistence,
+										  relparalleldml,
 										  false,
 										  RelationIsMapped(OldHeap),
 										  ONCOMMIT_NOOP,

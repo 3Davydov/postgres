@@ -221,4 +221,12 @@ extern bool function_parse_error_transpose(const char *prosrc);
 
 extern List *oid_array_to_list(Datum datum);
 
+#define ProparallelIsValid(proparallel) \
+	((proparallel) == PROPARALLEL_SAFE || \
+	 (proparallel) == PROPARALLEL_RESTRICTED || \
+	 (proparallel) == PROPARALLEL_UNSAFE)
+
+extern bool hazard_precedes(char proparallel1, char proparallel2);
+extern bool hazard_precedes_or_equals(char proparallel1, char proparallel2);
+
 #endif							/* PG_PROC_H */

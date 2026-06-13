@@ -765,6 +765,7 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 			   ObjectAddress *typaddress, const char *queryString)
 {
 	char		relname[NAMEDATALEN];
+	char		relparalleldml = PROPARALLEL_SAFE;
 	Oid			namespaceId;
 	Oid			relationId;
 	Oid			tablespaceId;
@@ -1046,6 +1047,13 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 			accessMethodId = get_table_am_oid(default_table_access_method, false);
 	}
 
+	// TODO add test for it
+	if (stmt->relation->relpersistence == RELPERSISTENCE_TEMP ||
+		relkind == RELKIND_FOREIGN_TABLE)
+	{
+		relparalleldml = PROPARALLEL_UNSAFE;
+	}
+
 	/*
 	 * Create the relation.  Inherited defaults and CHECK constraints are
 	 * passed in for immediate handling --- since they don't need parsing,
@@ -1064,6 +1072,7 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 													  old_constraints),
 										  relkind,
 										  stmt->relation->relpersistence,
+										  relparalleldml,
 										  false,
 										  false,
 										  stmt->oncommit,

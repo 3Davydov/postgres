@@ -1950,6 +1950,8 @@ formrdesc(const char *relationName, Oid relationReltype,
 	/* formrdesc is used only for permanent relations */
 	relation->rd_rel->relpersistence = RELPERSISTENCE_PERMANENT;
 
+	relation->rd_rel->relparalleldml = PROPARALLEL_SAFE;
+
 	/* ... and they're always populated, too */
 	relation->rd_rel->relispopulated = true;
 
@@ -3522,6 +3524,7 @@ RelationBuildLocalRelation(const char *relname,
 						   bool shared_relation,
 						   bool mapped_relation,
 						   char relpersistence,
+						   char relparalleldml,
 						   char relkind)
 {
 	Relation	rel;
@@ -3665,6 +3668,8 @@ RelationBuildLocalRelation(const char *relname,
 			elog(ERROR, "invalid relpersistence: %c", relpersistence);
 			break;
 	}
+
+	rel->rd_rel->relparalleldml = relparalleldml;
 
 	/* if it's a materialized view, it's not populated initially */
 	if (relkind == RELKIND_MATVIEW)

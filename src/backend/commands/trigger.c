@@ -25,7 +25,9 @@
 #include "catalog/indexing.h"
 #include "catalog/objectaccess.h"
 #include "catalog/partition.h"
+#include "catalog/pg_attrdef.h"
 #include "catalog/pg_constraint.h"
+#include "catalog/pg_depend.h"
 #include "catalog/pg_inherits.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_trigger.h"
@@ -105,6 +107,8 @@ static void AfterTriggerEnlargeQueryState(void);
 static bool before_stmt_triggers_fired(Oid relid, CmdType cmdType);
 static HeapTuple check_modified_virtual_generated(TupleDesc tupdesc, HeapTuple tuple);
 
+static void RelationSetParallelDml(Oid relid, char new_paralleldml, Relation class_rel);
+static char FindMaxHazardAmongPartitions(Oid relid);
 
 /*
  * Create a trigger.  Returns the address of the created trigger.
@@ -192,7 +196,6 @@ CreateTriggerFiringOn(CreateTrigStmt *stmt, const char *queryString,
 	Relation	rel;
 	AclResult	aclresult;
 	Relation	tgrel;
-	Relation	pgrel;
 	HeapTuple	tuple = NULL;
 	Oid			funcrettype;
 	Oid			trigoid = InvalidOid;
@@ -208,6 +211,13 @@ CreateTriggerFiringOn(CreateTrigStmt *stmt, const char *queryString,
 	Oid			existing_constraint_oid = InvalidOid;
 	bool		existing_isInternal = false;
 	bool		existing_isClone = false;
+	char		funchazard = 0;
+
+	/*
+	 * Serialize trigger dependency changes with ALTER FUNCTION ... PARALLEL,
+	 * which recomputes relparalleldml from the trigger dependency graph.
+	 */
+	LockParallelDmlDependenciesForRead();
 
 	if (OidIsValid(relOid))
 		rel = table_open(relOid, ShareRowExclusiveLock);
@@ -1010,28 +1020,17 @@ CreateTriggerFiringOn(CreateTrigStmt *stmt, const char *queryString,
 		pfree(DatumGetPointer(values[Anum_pg_trigger_tgnewtable - 1]));
 
 	/*
-	 * Update relation's pg_class entry; if necessary; and if not, send an SI
-	 * message to make other backends (and this one) rebuild relcache entries.
+	 * If function of the newly created trigger has higher hazard than
+	 * trigger's relation has, we need to update relaton's hazard.
 	 */
-	pgrel = table_open(RelationRelationId, RowExclusiveLock);
-	tuple = SearchSysCacheCopy1(RELOID,
-								ObjectIdGetDatum(RelationGetRelid(rel)));
-	if (!HeapTupleIsValid(tuple))
-		elog(ERROR, "cache lookup failed for relation %u",
-			 RelationGetRelid(rel));
-	if (!((Form_pg_class) GETSTRUCT(tuple))->relhastriggers)
+	funchazard = func_parallel(funcoid);
+	if (hazard_precedes(rel->rd_rel->relparalleldml, funchazard))
 	{
-		((Form_pg_class) GETSTRUCT(tuple))->relhastriggers = true;
+		RelationSetParallelDml(RelationGetRelid(rel), funchazard, NULL);
 
-		CatalogTupleUpdate(pgrel, &tuple->t_self, tuple);
-
-		CommandCounterIncrement();
+		if (rel->rd_rel->relispartition)
+			PropagateParallelHazardFromChildToParent(RelationGetRelid(rel));
 	}
-	else
-		CacheInvalidateRelcacheByTuple(tuple);
-
-	heap_freetuple(tuple);
-	table_close(pgrel, RowExclusiveLock);
 
 	/*
 	 * If we're replacing a trigger, flush all the old dependencies before
@@ -1284,6 +1283,126 @@ TriggerSetParentTrigger(Relation trigRel,
 	systable_endscan(tgscan);
 }
 
+/*
+ * class_rel can contain opened and locked (with an appropriate mode) pg_class
+ * in order to avoid redundant open/close operations.
+ */
+static void
+RelationSetParallelDml(Oid relid, char new_paralleldml, Relation class_rel)
+{
+	Relation	pg_class_rel;
+	HeapTuple	pg_class_htup;
+	Form_pg_class classForm;
+
+	pg_class_rel = RelationIsValid(class_rel) ?
+		class_rel :
+		table_open(RelationRelationId, RowExclusiveLock);
+
+	pg_class_htup =
+		SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(relid));
+
+	if (!HeapTupleIsValid(pg_class_htup))
+		elog(ERROR, "cache lookup failed for relation %u",
+			 relid);
+
+	classForm = (Form_pg_class) GETSTRUCT(pg_class_htup);
+	classForm->relparalleldml = new_paralleldml;
+
+	CatalogTupleUpdate(pg_class_rel, &pg_class_htup->t_self,
+					   pg_class_htup);
+
+	CommandCounterIncrement();
+
+	heap_freetuple(pg_class_htup);
+
+	if (!RelationIsValid(class_rel))
+		table_close(pg_class_rel, RowExclusiveLock);
+}
+
+char
+FindMaxHazardAmongTriggers(Oid relid, Relation pg_trigger_rel)
+{
+	ScanKeyData tgkey[1];
+	SysScanDesc tgscan;
+	HeapTuple	tup;
+	char		max_hazard = PROPARALLEL_SAFE;
+
+	/*
+	 * We also need to hold the dmldependency lock in order to be sure that no
+	 * one will change trigger-function's hazard concurrently.
+	 */
+	Assert(CheckParallelDmlDependencyLockedByMe());
+
+	Assert(CheckRelationLockedByMe(pg_trigger_rel, AccessShareLock, true));
+
+	ScanKeyInit(&tgkey[0],
+				Anum_pg_trigger_tgrelid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(relid));
+
+	tgscan = systable_beginscan(pg_trigger_rel, TriggerRelidNameIndexId, true,
+								SnapshotSelf, 1, tgkey);
+
+	while (HeapTupleIsValid(tup = systable_getnext(tgscan)))
+	{
+		Form_pg_trigger trigger = (Form_pg_trigger) GETSTRUCT(tup);
+		char		funcparallel;
+
+		funcparallel = func_parallel(trigger->tgfoid);
+
+		if (hazard_precedes(max_hazard, funcparallel))
+			max_hazard = funcparallel;
+
+		if (max_hazard == PROPARALLEL_UNSAFE)
+			break;
+	}
+
+	systable_endscan(tgscan);
+
+	return max_hazard;
+}
+
+static char
+FindMaxHazardAmongPartitions(Oid relid)
+{
+	List	   *children;
+	ListCell   *lc;
+	char		max_hazard = PROPARALLEL_SAFE;
+
+	/*
+	 * We also need to hold the dmldependency lock in order to be sure that no
+	 * one will change partitions's hazard concurrently (via changing it
+	 * trigger's function).
+	 */
+	Assert(CheckParallelDmlDependencyLockedByMe());
+
+	children = find_inheritance_children(relid, NoLock);
+	foreach(lc, children)
+	{
+		Oid			childOid = lfirst_oid(lc);
+		HeapTuple	childtup;
+		Form_pg_class childForm;
+		char		childhazard;
+
+		childtup = SearchSysCache1(RELOID, ObjectIdGetDatum(childOid));
+		if (!HeapTupleIsValid(childtup))
+			elog(ERROR, "cache lookup failed for relation %u", childOid);
+
+		childForm = (Form_pg_class) GETSTRUCT(childtup);
+		childhazard = childForm->relparalleldml;
+		ReleaseSysCache(childtup);
+
+		if (hazard_precedes(max_hazard, childhazard))
+			max_hazard = childhazard;
+
+		if (max_hazard == PROPARALLEL_UNSAFE)
+			break;
+	}
+
+	list_free(children);
+
+	return max_hazard;
+}
 
 /*
  * Guts of trigger deletion.
@@ -1296,7 +1415,15 @@ RemoveTriggerById(Oid trigOid)
 	ScanKeyData skey[1];
 	HeapTuple	tup;
 	Oid			relid;
+	Oid			funcid;
 	Relation	rel;
+	char		funchazard;
+
+	/*
+	 * Serialize trigger dependency changes with ALTER FUNCTION ... PARALLEL,
+	 * which recomputes relparalleldml from the trigger dependency graph.
+	 */
+	LockParallelDmlDependenciesForRead();
 
 	tgrel = table_open(TriggerRelationId, RowExclusiveLock);
 
@@ -1319,6 +1446,7 @@ RemoveTriggerById(Oid trigOid)
 	 * Open and exclusive-lock the relation the trigger belongs to.
 	 */
 	relid = ((Form_pg_trigger) GETSTRUCT(tup))->tgrelid;
+	funcid = ((Form_pg_trigger) GETSTRUCT(tup))->tgfoid;
 
 	rel = table_open(relid, AccessExclusiveLock);
 
@@ -1338,12 +1466,45 @@ RemoveTriggerById(Oid trigOid)
 				 errmsg("permission denied: \"%s\" is a system catalog",
 						RelationGetRelationName(rel))));
 
+	funchazard = func_parallel(funcid);
+	Assert(hazard_precedes_or_equals(funchazard, rel->rd_rel->relparalleldml));
+
 	/*
 	 * Delete the pg_trigger tuple.
 	 */
 	CatalogTupleDelete(tgrel, &tup->t_self);
 
 	systable_endscan(tgscan);
+
+	/*
+	 * If deleted trigger's function has the same hazard level as trigger's
+	 * relation, then we should scan all relation's triggers and find the
+	 * maximum hazard among them.
+	 */
+	if (funchazard == rel->rd_rel->relparalleldml)
+	{
+		char max_hazard;
+
+		if (rel->rd_rel->relkind == RELKIND_FOREIGN_TABLE ||
+			rel->rd_rel->relpersistence == RELPERSISTENCE_TEMP)
+		{
+			Assert(rel->rd_rel->relparalleldml == PROPARALLEL_UNSAFE);
+			max_hazard = PROPARALLEL_UNSAFE;
+		}
+		else
+		{
+			max_hazard = FindMaxHazardAmongTriggers(RelationGetRelid(rel), tgrel);
+		}
+
+		if (max_hazard != rel->rd_rel->relparalleldml)
+		{
+			RelationSetParallelDml(RelationGetRelid(rel), max_hazard, NULL);
+
+			if (rel->rd_rel->relispartition)
+				PropagateParallelHazardFromChildToParent(RelationGetRelid(rel));
+		}
+	}
+
 	table_close(tgrel, RowExclusiveLock);
 
 	/*
@@ -1359,6 +1520,64 @@ RemoveTriggerById(Oid trigOid)
 
 	/* Keep lock on trigger's rel until end of xact */
 	table_close(rel, NoLock);
+}
+
+void
+PropagateParallelHazardFromChildToParent(Oid child_oid)
+{
+	List	   *parents;
+	ListCell   *lc;
+	Relation tgrel;
+	Relation classrel;
+
+	parents = get_partition_ancestors(child_oid);
+	tgrel = table_open(TriggerRelationId, RowExclusiveLock);
+	classrel = table_open(RelationRelationId, RowExclusiveLock);
+
+	foreach(lc, parents)
+	{
+		Oid			parentid = lfirst_oid(lc);
+		Relation	parent;
+		char		max_hazard;
+		char		max_tg_hazard;
+
+		parent = table_open(parentid, ShareRowExclusiveLock);
+
+		if (parent->rd_rel->relkind == RELKIND_FOREIGN_TABLE ||
+			parent->rd_rel->relpersistence == RELPERSISTENCE_TEMP)
+		{
+			table_close(parent, NoLock);
+			continue;
+		}
+
+		max_hazard = FindMaxHazardAmongPartitions(RelationGetRelid(parent));
+
+		if (max_hazard == parent->rd_rel->relparalleldml)
+		{
+			table_close(parent, NoLock);
+			continue;
+		}
+
+		max_tg_hazard = FindMaxHazardAmongTriggers(RelationGetRelid(parent), tgrel);
+
+		/*
+		 * No need to update parent's hazard, if parent already have trigger
+		 * with bigger hazard.
+		 */
+		if (hazard_precedes(max_hazard, max_tg_hazard))
+		{
+			table_close(parent, NoLock);
+			continue;
+		}
+
+		RelationSetParallelDml(RelationGetRelid(parent), max_hazard, classrel);
+
+		table_close(parent, NoLock);
+	}
+
+	table_close(classrel, RowExclusiveLock);
+	table_close(tgrel, RowExclusiveLock);
+	list_free(parents);
 }
 
 /*

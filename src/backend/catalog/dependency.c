@@ -1348,6 +1348,7 @@ deleteOneObject(const ObjectAddress *object, Relation *depRel, int flags)
 /*
  * doDeletion: actually delete a single object
  */
+// TODO all possible dependencies can be found here
 static void
 doDeletion(const ObjectAddress *object, int flags)
 {
